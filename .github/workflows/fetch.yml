@@ -4,17 +4,17 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python3 -m pip install requests beautifulsoup4
 
@@ -30,82 +30,171 @@ jobs:
           from bs4 import BeautifulSoup
 
           START_URL = "https://gx-launcher.github.io/game/classic-0.0.11a-wasm/index.html"
-          OUTPUT_DIR = "game"
 
           session = requests.Session()
           session.headers["User-Agent"] = "Mozilla/5.0 AssetCrawler/1.0"
 
-          start_host = urlparse(START_URL).netloc
+          allowed_host = urlparse(START_URL).netloc
 
           queue = deque([START_URL])
           visited = set()
 
-          os.makedirs(OUTPUT_DIR, exist_ok=True)
+          extensions = (
+              ".html",
+              ".htm",
+              ".js",
+              ".wasm",
+              ".epk",
+              ".data",
+              ".pak",
+              ".bin",
+              ".json",
+              ".css",
+              ".png",
+              ".jpg",
+              ".jpeg",
+              ".gif",
+              ".webp",
+              ".svg",
+              ".ico",
+              ".zip",
+          )
 
-          def make_local_path(url):
+          def filename_for(url):
+              path = unquote(urlparse(url).path)
+              filename = os.path.basename(path)
+
+              if not filename:
+                  filename = "index.html"
+
+              # Remove query-string-like junk from filenames.
+              filename = filename.split("?")[0]
+
+              return filename
+
+          def unique_filename(filename):
+              if not os.path.exists(filename):
+                  return filename
+
+              name, ext = os.path.splitext(filename)
+
+              number = 1
+
+              while True:
+                  candidate = f"{name}_{number}{ext}"
+
+                  if not os.path.exists(candidate):
+                      return candidate
+
+                  number += 1
+
+          def make_url(value, current_url):
+              value = value.strip().strip("\"'`")
+
+              if not value:
+                  return None
+
+              if value.startswith((
+                  "#",
+                  "data:",
+                  "javascript:",
+                  "mailto:",
+                  "blob:",
+                  "about:",
+              )):
+                  return None
+
+              url = urljoin(current_url, value)
               parsed = urlparse(url)
-              path = unquote(parsed.path)
 
-              if not path or path.endswith("/"):
-                  path += "index.html"
+              if parsed.scheme not in ("http", "https"):
+                  return None
 
-              path = path.lstrip("/")
+              if parsed.netloc != allowed_host:
+                  return None
 
-              return os.path.join(OUTPUT_DIR, path)
+              return url
 
-          def find_urls(text, current_url):
-              results = set()
+          def extract_html(text, current_url):
+              found = set()
 
-              patterns = [
-                  r'''(?:src|href|data-src|data-url)\s*=\s*["']([^"']+)["']''',
-                  r'''url\(\s*["']?([^"')]+)["']?\s*\)''',
-                  r'''["']([^"']+\.(?:js|wasm|epk|data|pak|zip|json|css|png|jpg|jpeg|gif|svg|ico|bin|txt|webp)(?:\?[^"']*)?)["']''',
-              ]
+              soup = BeautifulSoup(text, "html.parser")
 
-              for pattern in patterns:
-                  for match in re.findall(pattern, text, re.IGNORECASE):
-                      results.add(match)
+              for tag in soup.find_all(True):
+                  for attr in (
+                      "src",
+                      "href",
+                      "data-src",
+                      "data-url",
+                      "data-file",
+                      "data-path",
+                  ):
+                      value = tag.get(attr)
 
-              try:
-                  soup = BeautifulSoup(text, "html.parser")
+                      if value:
+                          url = make_url(
+                              value,
+                              current_url
+                          )
 
-                  for tag in soup.find_all(True):
-                      for attr in ("src", "href", "data-src", "data-url"):
-                          value = tag.get(attr)
+                          if url:
+                              found.add(url)
 
-                          if value:
-                              results.add(value)
+              return found
 
-              except Exception:
-                  pass
+          def extract_text(text, current_url):
+              found = set()
 
-              urls = set()
+              # Only consider quoted strings that look like
+              # paths/files rather than arbitrary JavaScript.
+              pattern = r'''["'`]([^"'`]{1,500})["'`]'''
 
-              for value in results:
+              for value in re.findall(pattern, text):
+
                   value = value.strip()
 
                   if not value:
                       continue
 
-                  if value.startswith(
-                      ("#", "data:", "javascript:", "mailto:")
+                  lower = value.lower()
+
+                  looks_like_file = any(
+                      lower.split("?")[0].endswith(ext)
+                      for ext in extensions
+                  )
+
+                  looks_like_path = (
+                      "/" in value
+                      or value.startswith(
+                          ("./", "../", "/")
+                      )
+                  )
+
+                  if not (
+                      looks_like_file
+                      or looks_like_path
                   ):
                       continue
 
-                  absolute = urljoin(current_url, value)
-                  parsed = urlparse(absolute)
-
-                  if parsed.scheme not in ("http", "https"):
+                  # Don't treat normal sentences as paths.
+                  if " " in value and not (
+                      value.startswith("./")
+                      or value.startswith("../")
+                  ):
                       continue
 
-                  if parsed.netloc != start_host:
-                      continue
+                  url = make_url(
+                      value,
+                      current_url
+                  )
 
-                  urls.add(absolute)
+                  if url:
+                      found.add(url)
 
-              return urls
+              return found
 
           while queue:
+
               url = queue.popleft()
 
               if url in visited:
@@ -113,61 +202,142 @@ jobs:
 
               visited.add(url)
 
+              print()
               print("[FETCH]", url)
 
               try:
-                  response = session.get(url, timeout=30)
+                  response = session.get(
+                      url,
+                      timeout=60
+                  )
+
                   response.raise_for_status()
+
               except Exception as error:
                   print("[ERROR]", error)
                   continue
 
-              local_file = make_local_path(url)
+              filename = filename_for(
+                  response.url
+              )
 
-              os.makedirs(os.path.dirname(local_file), exist_ok=True)
+              filename = unique_filename(
+                  filename
+              )
 
-              with open(local_file, "wb") as file:
+              print("[SAVE ]", filename)
+
+              with open(filename, "wb") as file:
                   file.write(response.content)
 
               content_type = response.headers.get(
-                  "content-type", ""
+                  "content-type",
+                  ""
               ).lower()
 
-              if (
+              is_text = (
                   "text/" in content_type
                   or "javascript" in content_type
                   or "json" in content_type
-                  or local_file.endswith(
-                      (".html", ".htm", ".js", ".css", ".json", ".txt")
+                  or filename.lower().endswith(
+                      (
+                          ".html",
+                          ".htm",
+                          ".js",
+                          ".css",
+                          ".json",
+                          ".txt",
+                      )
+                  )
+              )
+
+              if not is_text:
+                  continue
+
+              try:
+                  text = response.text
+              except Exception:
+                  continue
+
+              discovered = set()
+
+              if filename.lower().endswith(
+                  (".html", ".htm")
+              ):
+                  discovered |= extract_html(
+                      text,
+                      response.url
+                  )
+
+              discovered |= extract_text(
+                  text,
+                  response.url
+              )
+
+              for new_url in sorted(discovered):
+
+                  if new_url not in visited:
+                      queue.append(new_url)
+                      print(
+                          "[DISCOVER]",
+                          new_url
+                      )
+
+          print()
+          print("=" * 60)
+          print("CRAWL COMPLETE")
+          print("=" * 60)
+
+          print(
+              "URLs visited:",
+              len(visited)
+          )
+
+          print()
+          print("Root files:")
+
+          for filename in sorted(
+              os.listdir(".")
+          ):
+              if os.path.isfile(filename):
+                  print(filename)
+
+          print()
+          print("=" * 60)
+          print("GAME ARCHIVES")
+          print("=" * 60)
+
+          found = False
+
+          for filename in sorted(
+              os.listdir(".")
+          ):
+
+              if filename.lower().endswith(
+                  (
+                      ".epk",
+                      ".pak",
+                      ".data",
+                      ".zip",
+                      ".bin",
                   )
               ):
-                  try:
-                      text = response.text
 
-                      for discovered_url in find_urls(text, url):
-                          if discovered_url not in visited:
-                              queue.append(discovered_url)
+                  found = True
 
-                  except Exception as error:
-                      print("[PARSE ERROR]", error)
+                  size = os.path.getsize(
+                      filename
+                  )
 
-          print()
-          print("========== CRAWL COMPLETE ==========")
-          print("Files downloaded:", len(visited))
+                  print(
+                      filename,
+                      "(",
+                      size,
+                      "bytes)"
+                  )
 
-          print()
-          print("========== EPK FILES ==========")
-
-          epk_found = False
-
-          for root, directories, files in os.walk(OUTPUT_DIR):
-              for filename in files:
-                  if filename.lower().endswith(".epk"):
-                      epk_found = True
-                      print(os.path.join(root, filename))
-
-          if not epk_found:
-              print("No EPK files found.")
+          if not found:
+              print("No obvious archives found.")
 
           PY
 
@@ -175,16 +345,33 @@ jobs:
 
       - name: List downloaded files
         run: |
-          echo "========== FILES =========="
-          find game -type f | sort
+          echo "================================"
+          echo "DOWNLOADED FILES"
+          echo "================================"
 
-          echo
-          echo "========== EPK FILES =========="
-          find game -type f -iname "*.epk" -print || true
+          find . -maxdepth 1 -type f -printf '%f (%s bytes)\n' | sort
 
       - name: Upload assets
         uses: actions/upload-artifact@v4
         with:
           name: game-assets
-          path: game
+          path: |
+            *.html
+            *.htm
+            *.js
+            *.wasm
+            *.epk
+            *.data
+            *.pak
+            *.bin
+            *.json
+            *.css
+            *.png
+            *.jpg
+            *.jpeg
+            *.gif
+            *.webp
+            *.svg
+            *.ico
+            *.zip
           if-no-files-found: warn
