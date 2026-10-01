@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   crawl:
@@ -14,56 +14,48 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install crawler dependencies
+      - name: Install Python dependencies
         run: |
-          python3 -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          python3 -m pip install requests beautifulsoup4
 
-      - name: Crawl website
+      - name: Crawl game
         run: |
           cat > crawler.py <<'PY'
           import os
           import re
-          import sys
           from collections import deque
           from urllib.parse import urljoin, urlparse, unquote
 
           import requests
           from bs4 import BeautifulSoup
 
-          START = "https://gx-launcher.github.io/game/classic-0.0.11a-wasm/index.html"
-          OUTPUT = "game"
+          START_URL = "https://gx-launcher.github.io/game/classic-0.0.11a-wasm/index.html"
+          OUTPUT_DIR = "game"
 
           session = requests.Session()
-          session.headers.update({
-              "User-Agent": "Mozilla/5.0 GitHubActions AssetCrawler/1.0"
-          })
+          session.headers["User-Agent"] = "Mozilla/5.0 AssetCrawler/1.0"
 
-          start_host = urlparse(START).netloc
-          start_path = urlparse(START).path
-          base_dir = start_path.rsplit("/", 1)[0] + "/"
+          start_host = urlparse(START_URL).netloc
 
-          queue = deque([START])
+          queue = deque([START_URL])
           visited = set()
 
-          os.makedirs(OUTPUT, exist_ok=True)
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-          def local_path(url):
+          def make_local_path(url):
               parsed = urlparse(url)
               path = unquote(parsed.path)
 
               if not path or path.endswith("/"):
                   path += "index.html"
 
-              # Prevent absolute paths from escaping OUTPUT.
               path = path.lstrip("/")
 
-              return os.path.join(OUTPUT, path)
+              return os.path.join(OUTPUT_DIR, path)
 
-          def extract_urls(text, current_url):
-              found = set()
+          def find_urls(text, current_url):
+              results = set()
 
-              # HTML/CSS/JS style URLs.
               patterns = [
                   r'''(?:src|href|data-src|data-url)\s*=\s*["']([^"']+)["']''',
                   r'''url\(\s*["']?([^"')]+)["']?\s*\)''',
@@ -71,30 +63,33 @@ jobs:
               ]
 
               for pattern in patterns:
-                  for match in re.findall(pattern, text, re.I):
-                      found.add(match)
+                  for match in re.findall(pattern, text, re.IGNORECASE):
+                      results.add(match)
 
-              # Let BeautifulSoup catch normal HTML references too.
               try:
                   soup = BeautifulSoup(text, "html.parser")
 
                   for tag in soup.find_all(True):
                       for attr in ("src", "href", "data-src", "data-url"):
                           value = tag.get(attr)
+
                           if value:
-                              found.add(value)
+                              results.add(value)
+
               except Exception:
                   pass
 
               urls = set()
 
-              for value in found:
+              for value in results:
                   value = value.strip()
 
                   if not value:
                       continue
 
-                  if value.startswith(("#", "data:", "javascript:", "mailto:")):
+                  if value.startswith(
+                      ("#", "data:", "javascript:", "mailto:")
+                  ):
                       continue
 
                   absolute = urljoin(current_url, value)
@@ -103,7 +98,6 @@ jobs:
                   if parsed.scheme not in ("http", "https"):
                       continue
 
-                  # Stay on the same host.
                   if parsed.netloc != start_host:
                       continue
 
@@ -119,88 +113,78 @@ jobs:
 
               visited.add(url)
 
-              print(f"[FETCH] {url}")
+              print("[FETCH]", url)
 
               try:
                   response = session.get(url, timeout=30)
                   response.raise_for_status()
-              except Exception as e:
-                  print(f"[ERROR] {url}: {e}")
+              except Exception as error:
+                  print("[ERROR]", error)
                   continue
 
-              path = local_path(url)
-              os.makedirs(os.path.dirname(path), exist_ok=True)
+              local_file = make_local_path(url)
 
-              with open(path, "wb") as f:
-                  f.write(response.content)
+              os.makedirs(os.path.dirname(local_file), exist_ok=True)
 
-              content_type = response.headers.get("content-type", "").lower()
+              with open(local_file, "wb") as file:
+                  file.write(response.content)
 
-              # Parse text-based resources for more URLs.
+              content_type = response.headers.get(
+                  "content-type", ""
+              ).lower()
+
               if (
                   "text/" in content_type
                   or "javascript" in content_type
                   or "json" in content_type
-                  or path.endswith((".html", ".htm", ".js", ".css", ".json", ".txt"))
+                  or local_file.endswith(
+                      (".html", ".htm", ".js", ".css", ".json", ".txt")
+                  )
               ):
                   try:
                       text = response.text
 
-                      for discovered in extract_urls(text, url):
-                          if discovered not in visited:
-                              queue.append(discovered)
+                      for discovered_url in find_urls(text, url):
+                          if discovered_url not in visited:
+                              queue.append(discovered_url)
 
-                  except Exception as e:
-                      print(f"[PARSE ERROR] {url}: {e}")
+                  except Exception as error:
+                      print("[PARSE ERROR]", error)
 
           print()
           print("========== CRAWL COMPLETE ==========")
-          print(f"Files downloaded: {len(visited)}")
+          print("Files downloaded:", len(visited))
 
           print()
           print("========== EPK FILES ==========")
 
-          found_epk = False
+          epk_found = False
 
-          for root, dirs, files in os.walk(OUTPUT):
+          for root, directories, files in os.walk(OUTPUT_DIR):
               for filename in files:
                   if filename.lower().endswith(".epk"):
-                      found_epk = True
+                      epk_found = True
                       print(os.path.join(root, filename))
 
-          if not found_epk:
-              print("No .epk files found.")
+          if not epk_found:
+              print("No EPK files found.")
 
           PY
 
           python3 crawler.py
 
-      - name: Show downloaded files
+      - name: List downloaded files
         run: |
-          echo "========== DOWNLOADED FILES =========="
-          find game -type f -print | sort
+          echo "========== FILES =========="
+          find game -type f | sort
 
           echo
           echo "========== EPK FILES =========="
-          find game -type f \( -iname "*.epk" -o -iname "*.EPK" \) -print || true
+          find game -type f -iname "*.epk" -print || true
 
-      - name: Upload crawled assets
+      - name: Upload assets
         uses: actions/upload-artifact@v4
         with:
           name: game-assets
-          path: game/
-          if-no-files-found: error
-:::
-
-### What you'll get
-
-After running **Actions → Crawl Game Assets**, the workflow creates an artifact called **`game-assets`** containing the discovered files.
-
-For example, if the crawler discovers:
-
-```text
-index.html
-game.js
-game.wasm
-assets.epk
-some-data.data
+          path: game
+          if-no-files-found: warn
