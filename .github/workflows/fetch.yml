@@ -1,4 +1,4 @@
-name: Crawl Game Assets
+name: Fetch Game
 
 on:
   workflow_dispatch:
@@ -7,11 +7,11 @@ permissions:
   contents: write
 
 jobs:
-  crawl:
+  fetch:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install dependencies
@@ -20,7 +20,7 @@ jobs:
 
       - name: Crawl game
         run: |
-          cat > crawler.py <<'PY'
+          cat > /tmp/crawler.py <<'PY'
           import os
           import re
           from collections import deque
@@ -32,7 +32,7 @@ jobs:
           START_URL = "https://gx-launcher.github.io/game/classic-0.0.11a-wasm/index.html"
 
           session = requests.Session()
-          session.headers["User-Agent"] = "Mozilla/5.0 AssetCrawler/1.0"
+          session.headers["User-Agent"] = "Mozilla/5.0"
 
           allowed_host = urlparse(START_URL).netloc
 
@@ -60,33 +60,16 @@ jobs:
               ".zip",
           )
 
-          def filename_for(url):
+          def get_filename(url):
               path = unquote(urlparse(url).path)
               filename = os.path.basename(path)
 
               if not filename:
                   filename = "index.html"
 
-              # Remove query-string-like junk from filenames.
               filename = filename.split("?")[0]
 
               return filename
-
-          def unique_filename(filename):
-              if not os.path.exists(filename):
-                  return filename
-
-              name, ext = os.path.splitext(filename)
-
-              number = 1
-
-              while True:
-                  candidate = f"{name}_{number}{ext}"
-
-                  if not os.path.exists(candidate):
-                      return candidate
-
-                  number += 1
 
           def make_url(value, current_url):
               value = value.strip().strip("\"'`")
@@ -115,42 +98,45 @@ jobs:
 
               return url
 
-          def extract_html(text, current_url):
+          def extract_urls(text, current_url):
               found = set()
 
-              soup = BeautifulSoup(text, "html.parser")
+              try:
+                  soup = BeautifulSoup(
+                      text,
+                      "html.parser"
+                  )
 
-              for tag in soup.find_all(True):
-                  for attr in (
-                      "src",
-                      "href",
-                      "data-src",
-                      "data-url",
-                      "data-file",
-                      "data-path",
-                  ):
-                      value = tag.get(attr)
+                  for tag in soup.find_all(True):
+                      for attr in (
+                          "src",
+                          "href",
+                          "data-src",
+                          "data-url",
+                          "data-file",
+                          "data-path",
+                      ):
+                          value = tag.get(attr)
 
-                      if value:
-                          url = make_url(
-                              value,
-                              current_url
-                          )
+                          if value:
+                              url = make_url(
+                                  value,
+                                  current_url
+                              )
 
-                          if url:
-                              found.add(url)
+                              if url:
+                                  found.add(url)
 
-              return found
+              except Exception:
+                  pass
 
-          def extract_text(text, current_url):
-              found = set()
-
-              # Only consider quoted strings that look like
-              # paths/files rather than arbitrary JavaScript.
+              # Look for quoted asset paths in JS/CSS.
               pattern = r'''["'`]([^"'`]{1,500})["'`]'''
 
-              for value in re.findall(pattern, text):
-
+              for value in re.findall(
+                  pattern,
+                  text
+              ):
                   value = value.strip()
 
                   if not value:
@@ -176,7 +162,7 @@ jobs:
                   ):
                       continue
 
-                  # Don't treat normal sentences as paths.
+                  # Ignore normal JavaScript sentences.
                   if " " in value and not (
                       value.startswith("./")
                       or value.startswith("../")
@@ -194,7 +180,6 @@ jobs:
               return found
 
           while queue:
-
               url = queue.popleft()
 
               if url in visited:
@@ -202,7 +187,6 @@ jobs:
 
               visited.add(url)
 
-              print()
               print("[FETCH]", url)
 
               try:
@@ -210,22 +194,31 @@ jobs:
                       url,
                       timeout=60
                   )
-
                   response.raise_for_status()
 
               except Exception as error:
                   print("[ERROR]", error)
                   continue
 
-              filename = filename_for(
+              filename = get_filename(
                   response.url
               )
 
-              filename = unique_filename(
-                  filename
-              )
+              # Don't overwrite files from different URLs.
+              if os.path.exists(filename):
+                  base, ext = os.path.splitext(filename)
+                  number = 1
 
-              print("[SAVE ]", filename)
+                  while os.path.exists(
+                      f"{base}_{number}{ext}"
+                  ):
+                      number += 1
+
+                  filename = (
+                      f"{base}_{number}{ext}"
+                  )
+
+              print("[SAVE]", filename)
 
               with open(filename, "wb") as file:
                   file.write(response.content)
@@ -259,60 +252,30 @@ jobs:
               except Exception:
                   continue
 
-              discovered = set()
-
-              if filename.lower().endswith(
-                  (".html", ".htm")
-              ):
-                  discovered |= extract_html(
-                      text,
-                      response.url
-                  )
-
-              discovered |= extract_text(
+              for discovered in extract_urls(
                   text,
                   response.url
-              )
-
-              for new_url in sorted(discovered):
-
-                  if new_url not in visited:
-                      queue.append(new_url)
-                      print(
-                          "[DISCOVER]",
-                          new_url
-                      )
+              ):
+                  if discovered not in visited:
+                      queue.append(discovered)
 
           print()
-          print("=" * 60)
+          print("================================")
           print("CRAWL COMPLETE")
-          print("=" * 60)
-
-          print(
-              "URLs visited:",
-              len(visited)
-          )
+          print("================================")
+          print("URLs visited:", len(visited))
 
           print()
-          print("Root files:")
+          print("Downloaded game files:")
 
-          for filename in sorted(
-              os.listdir(".")
-          ):
+          for filename in sorted(os.listdir(".")):
               if os.path.isfile(filename):
                   print(filename)
 
           print()
-          print("=" * 60)
-          print("GAME ARCHIVES")
-          print("=" * 60)
+          print("Possible archives:")
 
-          found = False
-
-          for filename in sorted(
-              os.listdir(".")
-          ):
-
+          for filename in sorted(os.listdir(".")):
               if filename.lower().endswith(
                   (
                       ".epk",
@@ -322,56 +285,30 @@ jobs:
                       ".bin",
                   )
               ):
-
-                  found = True
-
-                  size = os.path.getsize(
-                      filename
-                  )
-
-                  print(
-                      filename,
-                      "(",
-                      size,
-                      "bytes)"
-                  )
-
-          if not found:
-              print("No obvious archives found.")
+                  print(filename)
 
           PY
 
-          python3 crawler.py
+          python3 /tmp/crawler.py
 
-      - name: List downloaded files
+      - name: Show downloaded files
         run: |
           echo "================================"
-          echo "DOWNLOADED FILES"
+          echo "FILES TO COMMIT"
           echo "================================"
 
-          find . -maxdepth 1 -type f -printf '%f (%s bytes)\n' | sort
+          git status --short
 
-      - name: Upload assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: game-assets
-          path: |
-            *.html
-            *.htm
-            *.js
-            *.wasm
-            *.epk
-            *.data
-            *.pak
-            *.bin
-            *.json
-            *.css
-            *.png
-            *.jpg
-            *.jpeg
-            *.gif
-            *.webp
-            *.svg
-            *.ico
-            *.zip
-          if-no-files-found: warn
+      - name: Commit downloaded files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Fetch game assets"
+            git push
+          fi
